@@ -1,0 +1,57 @@
+# ========================
+# .NET Core / Build Output
+# ========================
+[Bb]in/
+[Oo]bj/
+/out
+/publish
+
+# ========================
+# IDE & Visual Studio
+# ========================
+.vs/
+.vscode/
+*.user
+*.suo
+*.userprefs
+*.launch
+.idea/
+
+# ========================
+# Configuration & Secrets
+# ========================
+# CRITICAL: Never commit your production keys/passwords
+appsettings.Development.json
+appsettings.Production.json
+
+# (Optional) Keep an example file so devs know what structure to use
+!appsettings.Development.example.json
+
+# ========================
+# Logs & Diagnostics
+# ========================
+# Ignores the Logs folder anywhere in the project (Root or inside ProjectManager)
+Logs/
+**/Logs/
+*.log
+
+# ========================
+# OS Generated Files
+# ========================
+.DS_Store
+Thumbs.db
+# Test and coverage output
+TestResults/
+**/TestResults/
+coverage/
+**/coverage/
+*.coverage
+*.coveragexml
+coverage.cobertura.xml
+
+# Temporary backup files
+*.backup
+*.bak
+
+# Publish output at any level
+**/publish/

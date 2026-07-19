@@ -1,0 +1,338 @@
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using ProjectManager.Data;
+using ProjectManager.DTOs;
+using ProjectManager.Interfaces;
+using ProjectManager.Models;
+using System.ComponentModel.DataAnnotations;
+using System.Security.Claims;
+
+namespace ProjectManager.Controllers
+{
+    [ApiController]
+    [Authorize]
+    [Route("api/[controller]")]
+    public class TaskController : ControllerBase
+    {
+        private readonly UserManager<ApplicationUser> _userManager;
+        private readonly IProjectRepository _projectRepository;
+        private readonly ITaskRepository _taskRepository;
+        private readonly IAuthorizationService _authorizationService;
+        public TaskController(UserManager<ApplicationUser> userManager, ITaskRepository taskRepository, IProjectRepository projectRepository, IAuthorizationService authorizationService)
+        {
+            _userManager = userManager;
+            _taskRepository = taskRepository;
+            _projectRepository = projectRepository;
+            _authorizationService = authorizationService;
+        }
+
+        // ---------------------------------------------------
+
+
+        // Actions
+        // Create Task inside a Project
+        [Authorize(Roles = "Admin, Manager")]
+        [HttpPost] // Route: api/Task
+        public async Task<IActionResult> CreateTask([FromBody] CreateTaskDto taskModel)
+        {
+            var user = await _userManager.GetUserAsync(User);
+            if (user == null)
+            {
+                return Unauthorized("User not found.");
+            }
+            var projectId = taskModel.ProjectId;
+            var project = await _projectRepository.GetProjectByIdAsync(projectId);
+
+            if (project == null)
+            {
+                return NotFound($"Project with ID {projectId} not found.");
+            }
+
+            var authCheck = await _authorizationService.AuthorizeAsync(User, project, "CanManageProject");
+            if (!authCheck.Succeeded)
+            {
+                return StatusCode(403, "You do not have permission to create tasks in this project.");
+            }
+
+            if (!project.ProjectUsers.Any(projectUser => projectUser.UserId == taskModel.AssignedUserId))
+            {
+                return BadRequest("The assigned user must be a member of the selected project.");
+            }
+
+            if (taskModel.TagIds is not null && !await _taskRepository.TagsExistAsync(taskModel.TagIds))
+            {
+                return BadRequest("One or more tag IDs do not exist.");
+            }
+
+            // Mapping DTO to Model
+            var newTask = new ProjectTask
+            {
+                Title = taskModel.Title,
+                Description = taskModel.Description,
+                Priority = taskModel.Priority,
+                DueDate = taskModel.DueDate,
+                Status = taskModel.Status,
+                ProjectId = taskModel.ProjectId,
+                CreatorId = user.Id,
+                AssignedUserId = taskModel.AssignedUserId
+            };
+
+            var result = await _taskRepository.CreateTaskAsync(newTask, taskModel.TagIds);
+
+            if (result == null)
+            {
+                return StatusCode(500, "An error occurred while creating the task.");
+            }
+            
+            return CreatedAtAction(
+                nameof(GetTaskById),
+                new { id = newTask.Id },
+                new { newTask.Id });
+
+        }
+
+
+        // --------------------------------------------------------------
+
+
+
+
+        [HttpGet]
+        public async Task<IActionResult> GetTasksAsync([FromQuery, Range(1, int.MaxValue)] int? projectId)
+        {
+            var currentUserId = User.FindFirstValue(ClaimTypes.NameIdentifier);
+            IEnumerable<TaskResponseDto> tasks;
+
+            if (!projectId.HasValue)
+            {
+                string? filterId = User.IsInRole("Admin") ? null : currentUserId;
+                tasks = await _taskRepository.GetDashboardTasksAsync(filterId);
+            }
+            else
+            {
+                string? filterId = User.IsInRole("Admin") ? null : currentUserId;
+                tasks = await _taskRepository.GetProjectTasksAsync(projectId.Value, filterId);
+            }
+
+            return Ok(tasks);
+        }
+
+
+        // --------------------------------------------------------------
+
+        // Get Task by ID
+        [HttpGet("{id}")] // Route: GET api/Task/{id}
+        public async Task<IActionResult> GetTaskById(int id)
+        {
+            var userId = User.FindFirstValue(ClaimTypes.NameIdentifier);
+            var task = await _taskRepository.GetTaskByIdAsync(id);
+
+
+            if (task == null)
+            {
+                return NotFound("Task not found.");
+            }
+            
+            var authCheck = await _authorizationService.AuthorizeAsync(User, task, "CanViewTask");
+            if (!authCheck.Succeeded)
+            {
+                return StatusCode(403, "You do not have permission to view this task.");
+            }
+
+            var taskDto = new TaskResponseDto
+                {
+                    Id = task.Id,
+                    Title = task.Title,
+                    Description = task.Description,
+                    DueDate = task.DueDate,
+                    Priority = task.Priority,
+                    Status = task.Status,
+                    CreatorId = task.CreatorId,
+                    ProjectId = task.ProjectId,
+                    ProjectName = task.Project.Name,
+                    AssignedUserId = task.AssignedUserId,
+                    AssignedUserName = task.AssignedUser.FirstName + " " + task.AssignedUser.LastName,
+                    Tags = task.TaskTags.Select(tt => tt.Tag.Name).ToList()
+                };
+
+            if (taskDto == null)
+            {
+                return NotFound("No records for such task are found.");
+            }
+
+            return Ok(taskDto);
+        }
+
+
+        // This action will result in replacing the previous assigned user with the new one.
+        // Only Administrators and Managers who own the project can reassign tasks.
+        [HttpPost("{id}/assign")] // Route: PUT /api/Task/{id}/assign
+        public async Task<IActionResult> AssignUserToTask(int id, [FromBody] TaskAssignDto model)
+        {
+            var task = await _taskRepository.GetTaskByIdAsync(id);
+
+            var currentUserId = User.FindFirstValue(ClaimTypes.NameIdentifier);
+
+            if (task == null)
+            {
+                return NotFound(new { Message = "Task not found." });
+            }
+            // Authorization Check
+            var authCheck = await _authorizationService.AuthorizeAsync(User, task, "CanAssignTask");
+            if (!authCheck.Succeeded)
+            {
+                return StatusCode(403, "You do not have permission to re-assign this task.");
+            }
+
+            if (!task.Project.ProjectUsers.Any(projectUser => projectUser.UserId == model.NewAssignedUserId))
+            {
+                return BadRequest("The assigned user must be a member of the task's project.");
+            }
+
+            // Perform Re-assignment
+            var result = await _taskRepository.AssignTaskToUserAsync(task, model.NewAssignedUserId);
+            if (result)
+            {
+                return NoContent();
+            }
+
+            return StatusCode(500, "An error occurred while re-assigning the task.");
+
+        }
+
+        // Delete Task by ID
+        [Authorize(Roles = "Admin, Manager")]
+        [HttpDelete("{id}")] // Route: DELETE /api/Task/{id}
+        public async Task<IActionResult> DeleteTask(int id)
+        {
+            var task = await _taskRepository.GetTaskByIdAsync(id);
+            var currentUserId = User.FindFirstValue(ClaimTypes.NameIdentifier);
+            if (task == null)
+            {
+                return NotFound(new { Message = "Task not found." });
+            }
+
+            var authCheck = await _authorizationService.AuthorizeAsync(User, task, "CanDeleteTask");
+            if (!authCheck.Succeeded)
+            {
+                return StatusCode(403, "You do not have permission to delete this task.");
+            }
+
+            if (task.Status == "In Progress")
+            {
+                return BadRequest("Cannot delete a task that is In Progress.");
+            }
+
+            var result = await _taskRepository.DeleteTaskAsync(id);
+            if (!result)
+            {
+                return StatusCode(500, "An error occurred while deleting the task.");
+            }
+            
+            return NoContent();
+        }
+
+
+
+        // Update basic Task details
+        // Only Administrators and Managers who own the project can update task details.
+        [HttpPut("{id}")] // Route: PUT /api/Task/{id}
+        public async Task<IActionResult> UpdateTask(int id, [FromBody] UpdateTaskDto taskModel)
+        {
+            var currentUserId = User.FindFirstValue(ClaimTypes.NameIdentifier);
+
+            // Fetch Task
+            var task = await _taskRepository.GetTaskByIdAsync(id);
+            if (task == null) return NotFound(new { Message = "Task not found." });
+
+            // Authorization (Gatekeeper)
+            var authCheck = await _authorizationService.AuthorizeAsync(User, task, "CanManageTask");
+            if (!authCheck.Succeeded) return StatusCode(403, "Unauthorized");
+
+            // Map DTO to Entity
+            // We update the properties on the 'task' object we already have in memory
+            task.Title = taskModel.Title;
+            task.Description = taskModel.Description;
+            task.Priority = taskModel.Priority;
+            task.DueDate = taskModel.DueDate;
+            task.Status = taskModel.Status;
+
+            var success = await _taskRepository.UpdateTaskAsync(task);
+
+            if (!success) return StatusCode(500, "Update failed.");
+
+            return NoContent();
+        }
+
+
+        // Update Task Tags
+        // PUT: api/Task/{taskId}/tags (Tags Only)
+        [Authorize]
+        [HttpPut("{id}/tags")]
+        public async Task<IActionResult> UpdateTaskTags(int id, [FromBody] List<int> tagIds)
+        {
+            var task = await _taskRepository.GetTaskByIdAsync(id);
+            if (task == null) return NotFound();
+
+            // AUTH CHECK
+            var authCheck = await _authorizationService.AuthorizeAsync(User, task, "CanManageTask");
+            if (!authCheck.Succeeded) return StatusCode(403, "Unauthorized");
+
+            if (tagIds.Any(tagId => tagId <= 0) || !await _taskRepository.TagsExistAsync(tagIds))
+            {
+                return BadRequest("One or more tag IDs do not exist.");
+            }
+
+            var success = await _taskRepository.UpdateTaskTagsAsync(id, tagIds.Distinct().ToList());
+            return success ? NoContent() : StatusCode(500);
+        }
+
+
+        // Update Task Status (for Member's ease - can be removed)
+        [Authorize]
+        [HttpPut("{id}/status")] // Route: PUT /api/Task/{id}/status
+        public async Task<IActionResult> UpdateTaskStatusByMember(int id, [FromBody] ChangeTaskStatusDto statusDto)
+        {
+            var task = await _taskRepository.GetTaskByIdAsync(id);
+            var currentUserId = User.FindFirstValue(ClaimTypes.NameIdentifier);
+            if (task == null)
+            {
+                return NotFound(new { Message = "Task not found." });
+            }
+            // Authorization: Members can only change status of tasks assigned to them
+            var authCheck = await _authorizationService.AuthorizeAsync(User, task, "CanUpdateTaskStatus");
+            if (!authCheck.Succeeded) return StatusCode(403, "Unauthorized");
+
+            // Update status
+            var result = await _taskRepository.UpdateTaskStatusAsync(task, statusDto.NewStatus);
+            if (!result)
+            {
+                return StatusCode(500, "An error occurred while updating the task status.");
+            }
+            return NoContent();
+        }
+
+        // ------------------------------------------------------------------
+
+
+        // Manager gets Overdue Tasks count
+
+        [Authorize(Roles = "Manager")]
+        [HttpGet("overdue-tasks")]  // api/Task/overdue-tasks
+        public async Task<IActionResult> GetOverdueTasksCount()
+        {
+            var creatorId = User.FindFirstValue(ClaimTypes.NameIdentifier);
+
+            var count = await _taskRepository.GetOverdueTasksCount(creatorId);
+
+            return Ok(new { count = count });
+
+        }
+
+
+
+
+    }
+}
